@@ -85,6 +85,21 @@ class DuckDBParser(parser.Parser):
 
     BITWISE = {k: v for k, v in parser.Parser.BITWISE.items() if k != TokenType.CARET}
 
+    # In DuckDB the JSON access operators (`->`, `->>`) bind looser than the
+    # arithmetic operators (like in Postgres), while the string concatenation
+    # operator `||` shares their precedence level and associates left-to-right.
+    JSON_INFIX_DPIPE = True
+
+    JSON_INFIX_PARSERS = {
+        TokenType.ARROW: parser.Parser.COLUMN_OPERATORS[TokenType.ARROW],
+        TokenType.DARROW: parser.Parser.COLUMN_OPERATORS[TokenType.DARROW],
+    }
+
+    COLUMN_OPERATORS = {
+        k: v for k, v in parser.Parser.COLUMN_OPERATORS.items()
+        if k not in (TokenType.ARROW, TokenType.DARROW)
+    }
+
     RANGE_PARSERS = {
         **parser.Parser.RANGE_PARSERS,
         TokenType.DAMP: binary_range_parser(exp.ArrayOverlaps),

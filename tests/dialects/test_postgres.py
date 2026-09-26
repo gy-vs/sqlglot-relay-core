@@ -212,7 +212,7 @@ class TestPostgres(Validator):
         )
         self.validate_identity(
             "x::JSON -> 'duration' ->> -1",
-            "JSON_EXTRACT_PATH_TEXT(CAST(x AS JSON) -> 'duration', -1)",
+            "CAST(x AS JSON) -> 'duration' ->> -1",
         ).assert_is(exp.JSONExtractScalar).this.assert_is(exp.JSONExtract)
         self.validate_identity(
             "SELECT SUBSTRING('Thomas' FOR 3 FROM 2)",
@@ -452,7 +452,7 @@ class TestPostgres(Validator):
     'field_id' AS field_id
 )
 SELECT
-  JSON_ARRAY_ELEMENTS(JSON_EXTRACT_PATH(json_data.data, field_ids.field_id)) AS element
+  JSON_ARRAY_ELEMENTS(json_data.data -> field_ids.field_id) AS element
 FROM json_data, field_ids""",
             pretty=True,
         )
@@ -1838,6 +1838,66 @@ CROSS JOIN JSON_ARRAY_ELEMENTS(CAST(JSON_EXTRACT_PATH(tbox, 'boxes') AS JSON)) A
                         "clickhouse": "SELECT JSONExtractString(foo, '12')",
                     },
                 )
+
+        # The JSON access operators bind looser than the arithmetic operators, so `-> 0 + 1`
+        # extracts the element at index 1 instead of adding 1 to an extracted json value:
+        # https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE
+        self.validate_identity("SELECT j -> 'b' -> 0 + 1 FROM t")
+        self.validate_identity("SELECT j -> 'b' ->> 2 - 1 FROM t")
+        expr = self.parse_one("SELECT j -> 'b' -> 0 + 1 FROM t")
+        extract = expr.selects[0]
+        self.assertIsInstance(extract, exp.JSONExtract)
+        self.assertIsInstance(extract.this, exp.JSONExtract)
+        self.assertIsInstance(extract.expression, exp.Add)
+
+        # Chained JSON operators stay left-associative
+        self.validate_identity("SELECT j #> '{a,b}' #>> '{c}' FROM t")
+        expr = self.parse_one("SELECT j #> '{a,b}' #>> '{c}'")
+        self.assertIsInstance(expr.selects[0], exp.JSONBExtractScalar)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONBExtract)
+
+        for sql, klass in (
+            ("SELECT j ? 'k'", exp.JSONBContains),
+            ("SELECT j ?| ARRAY['k']", exp.JSONBContainsAnyTopKeys),
+            ("SELECT j ?& ARRAY['k']", exp.JSONBContainsAllTopKeys),
+        ):
+            self.validate_identity(sql)
+            self.assertIsInstance(self.parse_one(sql).selects[0], klass)
+
+        # `||` shares the precedence level of the JSON operators and associates left-to-right
+        self.validate_identity("SELECT 'k' || j ->> 'a'")
+        expr = self.parse_one("SELECT 'k' || j ->> 'a'")
+        self.assertIsInstance(expr.selects[0], exp.JSONExtractScalar)
+        self.assertIsInstance(expr.selects[0].this, exp.DPipe)
+
+        self.validate_identity("SELECT j -> 'a' || 'k'")
+        expr = self.parse_one("SELECT j -> 'a' || 'k'")
+        self.assertIsInstance(expr.selects[0], exp.DPipe)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)
+
+        # The comparison operators bind looser than the JSON operators
+        expr = self.parse_one("SELECT j -> 'a' = 'x'")
+        self.assertIsInstance(expr.selects[0], exp.EQ)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)
+
+        # A column used as the JSON path roundtrips as the operator form; the
+        # JSON_EXTRACT_PATH function doesn't accept jsonb inputs, unlike the operator
+        self.validate_identity("SELECT d.data -> f.field_id FROM docs AS d, fields AS f")
+        expr = self.parse_one("SELECT d.data -> f.field_id FROM docs AS d, fields AS f")
+        self.assertIsInstance(expr.selects[0], exp.JSONExtract)
+        self.assertIsInstance(expr.selects[0].expression, exp.Column)
+
+        # A non-literal path such as a negative index must keep the operator form too
+        self.validate_identity("SELECT CAST(x AS JSONB) -> 'duration' ->> -1")
+        expr = self.parse_one("SELECT x::JSONB -> 'duration' ->> -1")
+        self.assertIsInstance(expr.selects[0], exp.JSONExtractScalar)
+        self.assertIsInstance(expr.selects[0].expression, exp.Neg)
+
+        # The function forms are still recognized and emitted when not written as operators
+        self.validate_identity("SELECT JSON_EXTRACT_PATH(j, 'a', 'b')")
+        self.validate_identity(
+            "SELECT JSON_EXTRACT_PATH_TEXT(x, k1, k2, k3) FROM t",
+        )
 
     def test_udt(self):
         def _validate_udt(sql: str):

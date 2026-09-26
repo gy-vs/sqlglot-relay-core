@@ -169,14 +169,6 @@ class PostgresParser(parser.Parser):
         TokenType.CARET: exp.Pow,
     }
 
-    RANGE_PARSERS = {
-        **parser.Parser.RANGE_PARSERS,
-        TokenType.DAMP: binary_range_parser(exp.ArrayOverlaps),
-        TokenType.DAT: lambda self, this: self.expression(
-            exp.MatchAgainst(this=self._parse_bitwise(), expressions=[this])
-        ),
-    }
-
     STATEMENT_PARSERS = {
         **parser.Parser.STATEMENT_PARSERS,
         TokenType.END: lambda self: self._parse_commit_or_rollback(),
@@ -190,21 +182,80 @@ class PostgresParser(parser.Parser):
 
     JSON_ARROWS_REQUIRE_JSON_TYPE = True
 
-    COLUMN_OPERATORS = {
-        **parser.Parser.COLUMN_OPERATORS,
-        TokenType.ARROW: lambda self, this, path: self.validate_expression(
-            build_json_extract_path(
-                exp.JSONExtract, arrow_req_json_type=self.JSON_ARROWS_REQUIRE_JSON_TYPE
-            )([this, path])
+    # In Postgres the JSON/JSONB access operators (`->`, `->>`, `#>`, `#>>`, `?`,
+    # `?|`, `?&`, `#-`, `@?`) belong to the "all other native and custom operators"
+    # precedence level, which is looser than `+`/`-` but tighter than the comparison
+    # operators and associates left-to-right with the string concatenation operator `||`:
+    # https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE
+    JSON_INFIX_DPIPE = True
+
+    JSON_INFIX_PARSERS = {
+        TokenType.ARROW: lambda self, this, path: self._build_arrow_json_extract(
+            exp.JSONExtract, this, path
         ),
-        TokenType.DARROW: lambda self, this, path: self.validate_expression(
-            build_json_extract_path(
-                exp.JSONExtractScalar, arrow_req_json_type=self.JSON_ARROWS_REQUIRE_JSON_TYPE
-            )([this, path])
+        TokenType.DARROW: lambda self, this, path: self._build_arrow_json_extract(
+            exp.JSONExtractScalar, this, path
+        ),
+        TokenType.HASH_ARROW: parser.Parser.COLUMN_OPERATORS[TokenType.HASH_ARROW],
+        TokenType.DHASH_ARROW: parser.Parser.COLUMN_OPERATORS[TokenType.DHASH_ARROW],
+        TokenType.PLACEHOLDER: parser.Parser.COLUMN_OPERATORS[TokenType.PLACEHOLDER],
+        TokenType.QMARK_PIPE: lambda self, this, path: self.expression(
+            exp.JSONBContainsAnyTopKeys(this=this, expression=path)
+        ),
+        TokenType.QMARK_AMP: lambda self, this, path: self.expression(
+            exp.JSONBContainsAllTopKeys(this=this, expression=path)
+        ),
+        TokenType.HASH_DASH: lambda self, this, path: self.expression(
+            exp.JSONBDeleteAtPath(this=this, expression=path)
+        ),
+        TokenType.AT_QMARK: lambda self, this, path: self.expression(
+            exp.JSONBPathExists(this=this, expression=path)
+        ),
+    }
+
+    COLUMN_OPERATORS = {
+        k: v
+        for k, v in parser.Parser.COLUMN_OPERATORS.items()
+        if k
+        not in (
+            TokenType.ARROW,
+            TokenType.DARROW,
+            TokenType.HASH_ARROW,
+            TokenType.DHASH_ARROW,
+            TokenType.PLACEHOLDER,
+        )
+    }
+
+    RANGE_PARSERS = {
+        **{
+            k: v
+            for k, v in parser.Parser.RANGE_PARSERS.items()
+            if k
+            not in (
+                TokenType.QMARK_PIPE,
+                TokenType.QMARK_AMP,
+                TokenType.HASH_DASH,
+                TokenType.AT_QMARK,
+            )
+        },
+        TokenType.DAMP: binary_range_parser(exp.ArrayOverlaps),
+        TokenType.DAT: lambda self, this: self.expression(
+            exp.MatchAgainst(this=self._parse_bitwise(), expressions=[this])
         ),
     }
 
     ARG_MODE_TOKENS: t.ClassVar = {TokenType.IN, TokenType.OUT, TokenType.INOUT, TokenType.VARIADIC}
+
+    def _build_arrow_json_extract(self, expr_type, this: exp.Expr | None, path: exp.Expr | None):
+        # `->`/`->>` always operate on json/jsonb and must roundtrip as operators, even
+        # when the path can't be folded into a JSONPath (e.g. a column or `-1`), since
+        # the JSON_EXTRACT_PATH(_TEXT) functions reject such inputs and jsonb values.
+        extract = build_json_extract_path(
+            expr_type, arrow_req_json_type=self.JSON_ARROWS_REQUIRE_JSON_TYPE
+        )([this, path])
+        if not isinstance(extract.expression, exp.JSONPath):
+            extract.set("only_json_types", True)
+        return self.validate_expression(extract)
 
     def _parse_parameter_mode(self) -> TokenType | None:
         """

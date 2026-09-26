@@ -185,7 +185,20 @@ def _json_extract_sql(
 ) -> t.Callable[[PostgresGenerator, JSON_EXTRACT_TYPE], str]:
     def _generate(self: PostgresGenerator, expression: JSON_EXTRACT_TYPE) -> str:
         if expression.args.get("only_json_types"):
-            return json_extract_segments(name, quoted_index=False, op=op)(self, expression)
+            path = expression.expression
+            if isinstance(path, exp.JSONPath):
+                return json_extract_segments(name, quoted_index=False, op=op)(self, expression)
+
+            if expression.expressions:
+                # A multi-segment path written with arbitrary (non-literal) segments can
+                # only be represented with the function form
+                return json_extract_segments(name)(self, expression)
+
+            # The path is a single arbitrary expression (e.g. a column or `-1`), which the
+            # operator form supports while JSON_EXTRACT_PATH doesn't -- the latter also
+            # rejects jsonb inputs, so keep the original operator form.
+            return f"{self.sql(expression, 'this')} {op} {self.sql(path)}"
+
         return json_extract_segments(name)(self, expression)
 
     return _generate

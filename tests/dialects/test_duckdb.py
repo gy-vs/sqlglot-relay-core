@@ -2995,3 +2995,50 @@ class TestDuckDB(Validator):
                 "snowflake": "SELECT TO_VARIANT('1')",
             },
         )
+
+    def test_json_extract_precedence(self):
+        # DuckDB, like Postgres, binds the arithmetic operators tighter than the JSON
+        # access operators, so `-> 0 + 1` extracts the element at index 1 rather than
+        # adding 1 to an extracted JSON value:
+        # https://duckdb.org/docs/sql/functions/json
+        self.validate_all(
+            "SELECT CAST('[10, 20, 30]' AS JSON) -> 0 + 1 AS v",
+            write={
+                "duckdb": "SELECT CAST('[10, 20, 30]' AS JSON) -> 0 + 1 AS v",
+            },
+        )
+        self.validate_all(
+            "SELECT CAST('[10, 20, 30]' AS JSON) ->> 2 - 1 AS v",
+            write={
+                "duckdb": "SELECT CAST('[10, 20, 30]' AS JSON) ->> 2 - 1 AS v",
+            },
+        )
+        self.validate_identity("SELECT CAST('[10, 20, 30]' AS JSON) -> 1 - 1 AS v")
+
+        expr = self.parse_one("SELECT CAST('[10, 20, 30]' AS JSON) -> 0 + 1 AS v")
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)
+        self.assertIsInstance(expr.selects[0].this.expression, exp.Add)
+
+        expr = self.parse_one("SELECT CAST('[10, 20, 30]' AS JSON) ->> 2 - 1 AS v")
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtractScalar)
+        self.assertIsInstance(expr.selects[0].this.expression, exp.Sub)
+
+        # The JSON access operators stay left-associative when chained
+        expr = self.parse_one("""SELECT '{"a": {"b": [1, 2]}}' -> 'a' -> 'b' -> 0""")
+        self.assertIsInstance(expr.selects[0], exp.JSONExtract)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)
+        self.assertIsInstance(expr.selects[0].this.this, exp.JSONExtract)
+
+        # `||` has the same precedence as the JSON operators and associates left-to-right
+        expr = self.parse_one("SELECT 'k' || j ->> 'a'")
+        self.assertIsInstance(expr.selects[0], exp.JSONExtractScalar)
+        self.assertIsInstance(expr.selects[0].this, exp.DPipe)
+
+        expr = self.parse_one("SELECT j -> 'a' || 'k'")
+        self.assertIsInstance(expr.selects[0], exp.DPipe)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)
+
+        # The comparison operators bind looser than the JSON operators
+        expr = self.parse_one("SELECT j -> 'a' = 'x'")
+        self.assertIsInstance(expr.selects[0], exp.EQ)
+        self.assertIsInstance(expr.selects[0].this, exp.JSONExtract)

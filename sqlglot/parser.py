@@ -69,7 +69,7 @@ def binary_range_parser(
     expr_type: Type[exp.Expr], reverse_args: bool = False
 ) -> t.Callable[[Parser, exp.Expr | None], exp.Expr | None]:
     def _parse_binary_range(self: Parser, this: exp.Expr | None) -> exp.Expr | None:
-        expression = self._parse_bitwise()
+        expression = self._parse_json_access()
         if reverse_args:
             this, expression = expression, this
         return self._parse_escape(self.expression(expr_type(this=this, expression=expression)))
@@ -1070,6 +1070,21 @@ class Parser:
         TokenType.DOTCOLON,
         TokenType.DCOLON,
     }
+
+    # Parsers for the JSON/JSONB infix operators, e.g. `->`, `->>`, `#>`, `#>>`, `?`
+    # in Postgres and DuckDB. These operators bind looser than the arithmetic operators
+    # (see https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE),
+    # so they can't be parsed greedily as column operators. When non-empty, the
+    # corresponding entries are expected to be removed from COLUMN_OPERATORS and the
+    # operators are parsed in _parse_json_access(), between the range and bitwise levels.
+    # Each parser receives the left-hand side and consumes the operator token along with
+    # its right-hand side, mirroring the RANGE_PARSERS callbacks.
+    JSON_INFIX_PARSERS: t.ClassVar[dict[TokenType, t.Callable]] = {}
+
+    # Whether the string concatenation operator `||` is parsed at the same level as the
+    # JSON infix operators, rather than at the bitwise level. In Postgres and DuckDB `||`
+    # has the same precedence as the JSON operators and associates left-to-right with them.
+    JSON_INFIX_DPIPE: t.ClassVar = False
 
     EXPRESSION_PARSERS: t.ClassVar = {
         exp.Cluster: lambda self: self._parse_sort(exp.Cluster, TokenType.CLUSTER_BY),
@@ -6003,7 +6018,7 @@ class Parser:
         return this
 
     def _parse_range(self, this: exp.Expr | None = None) -> exp.Expr | None:
-        this = this or self._parse_bitwise()
+        this = this or self._parse_json_access()
 
         while True:
             negate = self._match(TokenType.NOT)
@@ -6055,7 +6070,7 @@ class Parser:
 
         if self._match_text_seq("DISTINCT", "FROM"):
             klass = exp.NullSafeEQ if negate else exp.NullSafeNEQ
-            return self.expression(klass(this=this, expression=self._parse_bitwise()))
+            return self.expression(klass(this=this, expression=self._parse_json_access()))
 
         if self._match(TokenType.JSON):
             kind = self._match_texts(self.IS_JSON_PREDICATE_KIND) and self._prev.text.upper()
@@ -6117,9 +6132,9 @@ class Parser:
         elif self._match_text_seq("ASYMMETRIC"):
             symmetric = False
 
-        low = self._parse_bitwise()
+        low = self._parse_json_access()
         self._match(TokenType.AND)
-        high = self._parse_bitwise()
+        high = self._parse_json_access()
 
         return self.expression(exp.Between(this=this, low=low, high=high, symmetric=symmetric))
 
@@ -6233,7 +6248,49 @@ class Parser:
         self._retreat(index)
         return interval
 
+    def _parse_json_access(self) -> exp.Expr | None:
+        # In dialects where the JSON operators (`->`, `->>`, ...) bind looser than the
+        # arithmetic operators, they are parsed here, between the range (LIKE, IN, ...)
+        # and bitwise levels. The string concatenation operator `||` shares this level
+        # (e.g. in Postgres and DuckDB), so it is handled here as well.
+        if not self.JSON_INFIX_PARSERS:
+            return self._parse_bitwise()
+
+        this = self._parse_bitwise_ops()
+
+        while True:
+            if self._match_set(self.JSON_INFIX_PARSERS):
+                op = self._prev.token_type
+                # The right-hand side is parsed at the bitwise level so that tighter
+                # operators, e.g. `j -> 0 + 1` as `j -> (0 + 1)`, are consumed here,
+                # while these operators themselves stay left-associative.
+                field = self._parse_bitwise_ops()
+                this = self.expression(self.JSON_INFIX_PARSERS[op](self, this, field))
+            elif self.JSON_INFIX_DPIPE and self._match(TokenType.DPIPE):
+                this = self.expression(
+                    exp.DPipe(
+                        this=this,
+                        expression=self._parse_bitwise_ops(),
+                        safe=not self.dialect.STRICT_STRING_CONCAT,
+                    )
+                )
+            else:
+                break
+
+        return this
+
     def _parse_bitwise(self) -> exp.Expr | None:
+        # When the dialect parses JSON access operators (and optionally `||`) at a level
+        # looser than the bitwise one, _parse_bitwise is reached both directly (from the
+        # contexts that only expect a bitwise expression, e.g. function arguments) and
+        # through _parse_json_access. Delegating here ensures the looser operators are
+        # recognized in every expression context without changing their precedence.
+        if self.JSON_INFIX_PARSERS:
+            return self._parse_json_access()
+
+        return self._parse_bitwise_ops()
+
+    def _parse_bitwise_ops(self) -> exp.Expr | None:
         this = self._parse_term()
 
         while True:
@@ -6241,7 +6298,11 @@ class Parser:
                 this = self.expression(
                     self.BITWISE[self._prev.token_type](this=this, expression=self._parse_term())
                 )
-            elif self.dialect.DPIPE_IS_STRING_CONCAT and self._match(TokenType.DPIPE):
+            elif (
+                self.dialect.DPIPE_IS_STRING_CONCAT
+                and not self.JSON_INFIX_DPIPE
+                and self._match(TokenType.DPIPE)
+            ):
                 this = self.expression(
                     exp.DPipe(
                         this=this,
