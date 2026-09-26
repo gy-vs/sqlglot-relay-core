@@ -1071,6 +1071,11 @@ class Parser:
         TokenType.DCOLON,
     }
 
+    # JSON operators that are parsed as binary operators at the bitwise level instead of
+    # as column postfix operators. Dialects like Postgres and DuckDB parse e.g. `->` at a
+    # lower precedence than the arithmetic operators, so `j -> 0 + 1` is `j -> (0 + 1)`
+    JSON_OPERATORS: t.ClassVar = {}
+
     EXPRESSION_PARSERS: t.ClassVar = {
         exp.Cluster: lambda self: self._parse_sort(exp.Cluster, TokenType.CLUSTER_BY),
         exp.Column: lambda self: self._parse_column(),
@@ -6241,6 +6246,8 @@ class Parser:
                 this = self.expression(
                     self.BITWISE[self._prev.token_type](this=this, expression=self._parse_term())
                 )
+            elif self._match_set(self.JSON_OPERATORS):
+                this = self.JSON_OPERATORS[self._prev.token_type](self, this, self._parse_term())
             elif self.dialect.DPIPE_IS_STRING_CONCAT and self._match(TokenType.DPIPE):
                 this = self.expression(
                     exp.DPipe(

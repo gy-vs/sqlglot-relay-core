@@ -1687,6 +1687,19 @@ class TestDuckDB(Validator):
             },
         )
 
+    def test_json_operator_precedence(self):
+        # DuckDB's JSON extraction operators bind less tightly than the arithmetic
+        # operators, e.g. `j -> 0 + 1` is parsed as `j -> (0 + 1)`
+        self.validate_identity(
+            "SELECT CAST('[10, 20, 30]' AS JSON) -> 0 + 1 AS v"
+        ).expressions[0].this.assert_is(exp.JSONExtract).expression.assert_is(exp.Add)
+        self.validate_identity(
+            "SELECT CAST('[10, 20, 30]' AS JSON) ->> 2 - 1 AS v"
+        ).expressions[0].this.assert_is(exp.JSONExtractScalar).expression.assert_is(exp.Sub)
+        self.validate_identity("SELECT j -> 0 + 1 FROM t").expressions[0].assert_is(
+            exp.JSONExtract
+        ).expression.assert_is(exp.Add)
+
     def test_array_index(self):
         with self.assertLogs(helper_logger) as cm:
             self.validate_all(

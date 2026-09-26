@@ -184,6 +184,17 @@ def _json_extract_sql(
     name: str, op: str
 ) -> t.Callable[[PostgresGenerator, JSON_EXTRACT_TYPE], str]:
     def _generate(self: PostgresGenerator, expression: JSON_EXTRACT_TYPE) -> str:
+        path = expression.expression
+        if (
+            path is not None
+            and not isinstance(path, (exp.JSONPath, exp.Variadic))
+            and not expression.expressions
+            and not expression.args.get("only_json_types")
+        ):
+            # The path is not a literal (e.g. it's a column reference or an arithmetic
+            # expression), so it can't be transpiled to JSON_EXTRACT_PATH safely; the
+            # JSON_EXTRACT_PATH* functions also don't accept JSONB, unlike the operators
+            return f"{self.sql(expression, 'this')} {op} {self.sql(expression, 'expression')}"
         if expression.args.get("only_json_types"):
             return json_extract_segments(name, quoted_index=False, op=op)(self, expression)
         return json_extract_segments(name)(self, expression)

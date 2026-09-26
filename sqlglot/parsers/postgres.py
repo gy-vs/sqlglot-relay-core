@@ -190,8 +190,11 @@ class PostgresParser(parser.Parser):
 
     JSON_ARROWS_REQUIRE_JSON_TYPE = True
 
-    COLUMN_OPERATORS = {
-        **parser.Parser.COLUMN_OPERATORS,
+    # https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE
+    # Postgres's JSON operators belong to the "all other operators" precedence tier, so
+    # they bind less tightly than addition and subtraction, e.g. `j -> 0 + 1` parses as
+    # `j -> (0 + 1)`
+    JSON_OPERATORS = {
         TokenType.ARROW: lambda self, this, path: self.validate_expression(
             build_json_extract_path(
                 exp.JSONExtract, arrow_req_json_type=self.JSON_ARROWS_REQUIRE_JSON_TYPE
@@ -202,6 +205,22 @@ class PostgresParser(parser.Parser):
                 exp.JSONExtractScalar, arrow_req_json_type=self.JSON_ARROWS_REQUIRE_JSON_TYPE
             )([this, path])
         ),
+        TokenType.HASH_ARROW: parser.Parser.COLUMN_OPERATORS[TokenType.HASH_ARROW],
+        TokenType.DHASH_ARROW: parser.Parser.COLUMN_OPERATORS[TokenType.DHASH_ARROW],
+        TokenType.PLACEHOLDER: parser.Parser.COLUMN_OPERATORS[TokenType.PLACEHOLDER],
+    }
+
+    COLUMN_OPERATORS = {
+        k: v
+        for k, v in parser.Parser.COLUMN_OPERATORS.items()
+        if k
+        not in (
+            TokenType.ARROW,
+            TokenType.DARROW,
+            TokenType.HASH_ARROW,
+            TokenType.DHASH_ARROW,
+            TokenType.PLACEHOLDER,
+        )
     }
 
     ARG_MODE_TOKENS: t.ClassVar = {TokenType.IN, TokenType.OUT, TokenType.INOUT, TokenType.VARIADIC}

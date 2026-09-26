@@ -212,7 +212,7 @@ class TestPostgres(Validator):
         )
         self.validate_identity(
             "x::JSON -> 'duration' ->> -1",
-            "JSON_EXTRACT_PATH_TEXT(CAST(x AS JSON) -> 'duration', -1)",
+            "CAST(x AS JSON) -> 'duration' ->> -1",
         ).assert_is(exp.JSONExtractScalar).this.assert_is(exp.JSONExtract)
         self.validate_identity(
             "SELECT SUBSTRING('Thomas' FOR 3 FROM 2)",
@@ -452,7 +452,7 @@ class TestPostgres(Validator):
     'field_id' AS field_id
 )
 SELECT
-  JSON_ARRAY_ELEMENTS(JSON_EXTRACT_PATH(json_data.data, field_ids.field_id)) AS element
+  JSON_ARRAY_ELEMENTS(json_data.data -> field_ids.field_id) AS element
 FROM json_data, field_ids""",
             pretty=True,
         )
@@ -1838,6 +1838,46 @@ CROSS JOIN JSON_ARRAY_ELEMENTS(CAST(JSON_EXTRACT_PATH(tbox, 'boxes') AS JSON)) A
                         "clickhouse": "SELECT JSONExtractString(foo, '12')",
                     },
                 )
+
+    def test_json_operator_precedence(self):
+        # Postgres's JSON operators belong to the "all other operators" precedence tier,
+        # so they bind less tightly than addition and subtraction
+        # https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-PRECEDENCE
+        self.validate_identity("SELECT j -> 0 + 1 FROM t").expressions[0].assert_is(
+            exp.JSONExtract
+        ).expression.assert_is(exp.Add)
+        self.validate_identity("SELECT j -> 'b' -> 0 + 1 FROM t").expressions[0].assert_is(
+            exp.JSONExtract
+        ).expression.assert_is(exp.Add)
+        self.validate_all(
+            "SELECT j -> 'b' -> 0 + 1 FROM t",
+            write={
+                "postgres": "SELECT j -> 'b' -> 0 + 1 FROM t",
+                "duckdb": "SELECT j -> '$.b' -> 0 + 1 FROM t",
+            },
+        )
+
+        # The string concatenation operator belongs to the same precedence tier, so
+        # these associate from left to right
+        self.validate_identity("SELECT 'k' || j ->> 'a' FROM t").expressions[0].assert_is(
+            exp.JSONExtractScalar
+        ).this.assert_is(exp.DPipe)
+
+        # The #>, #>> and ? operators belong to the same precedence tier as ->
+        self.validate_identity("SELECT j #>> '{a,b}' + 1 FROM t").expressions[0].assert_is(
+            exp.JSONBExtractScalar
+        ).expression.assert_is(exp.Add)
+        self.validate_identity("SELECT j ? 'k' || 'x' FROM t").expressions[0].assert_is(
+            exp.DPipe
+        ).this.assert_is(exp.JSONBContains)
+
+        # Non-literal JSON paths roundtrip as operators, since the JSON_EXTRACT_PATH*
+        # functions don't accept JSONB and their path arguments must be literals
+        self.validate_identity("SELECT d.data -> f.field_id FROM docs AS d, fields AS f")
+        self.validate_identity(
+            "SELECT x::JSONB -> 'duration' ->> -1",
+            "SELECT CAST(x AS JSONB) -> 'duration' ->> -1",
+        )
 
     def test_udt(self):
         def _validate_udt(sql: str):
